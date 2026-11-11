@@ -1,0 +1,415 @@
+diff --git a/WhateverXe/kern_firmware.cpp b/WhateverXe/kern_firmware.cpp
+index 691e496..6e4c5b8 100644
+--- a/WhateverXe/kern_firmware.cpp
++++ b/WhateverXe/kern_firmware.cpp
+@@ -13,6 +13,17 @@ static void publishBytes(IOPCIDevice *pci,const char *key,const void *bytes,unsi
+ void XE::xelpReadFirmware(IOPCIDevice *pci) {
+     // Wiring is needed by framebuffer-only profiles before Render is admitted.
+     if(!pci || !xeProfile.displayAdmitted())return;
++    // AI 修改: explicit duplicate-DDI policy. Default remains fail-closed;
++    // the two switches are opt-in escapes for firmware tables that list more
++    // than one child for the same physical DDI.
++    XELP::VBT::ConflictPolicy conflictPolicy=XELP::VBT::ConflictPolicy::Reject;
++    const bool conflictFirst=checkKernelArgument("-wex-ddi-conflict-select-first");
++    const bool conflictLast=checkKernelArgument("-wex-ddi-conflict-select-last");
++    if(conflictFirst && !conflictLast)conflictPolicy=XELP::VBT::ConflictPolicy::SelectFirst;
++    else if(conflictLast && !conflictFirst)conflictPolicy=XELP::VBT::ConflictPolicy::SelectLast;
++    else if(conflictFirst && conflictLast)
++        SYSLOG("igfx","TGL DDI conflict: both select switches set; keeping reject");
++    pci->setProperty("TGLDDIConflictPolicy",static_cast<uint32_t>(conflictPolicy),32);
+     const uint32_t asls=pci->configRead32(0xFC);
+     uint32_t source=0;
+     if(asls && asls<=0xFFFFE000U) {
+@@ -30,14 +41,14 @@ void XE::xelpReadFirmware(IOPCIDevice *pci) {
+                     auto vbtMap=vbtMemory ? vbtMemory->map(kIOMapReadOnly) : nullptr;
+                     if(vbtMap && vbtMap->getVirtualAddress() && vbtMap->getLength()>=region.bytes) {
+                         const auto data=reinterpret_cast<const void *>(vbtMap->getVirtualAddress());
+-                        firmwarePorts=XELP::VBT::parse(data,region.bytes,xeProfile.family);
++                        firmwarePorts=XELP::VBT::parse(data,region.bytes,xeProfile.family,conflictPolicy);
+                         if(firmwarePorts.valid()){source=2;publishBytes(pci,"TGLVBT",data,firmwarePorts.bytes);}
+                     }
+                     if(vbtMap)vbtMap->release();
+                     if(vbtMemory)vbtMemory->release();
+                 }
+                 if(!firmwarePorts.valid()) {
+-                    const auto embedded=XELP::VBT::parse(bytes+0x400,region.inlineBytes,xeProfile.family);
++                    const auto embedded=XELP::VBT::parse(bytes+0x400,region.inlineBytes,xeProfile.family,conflictPolicy);
+                     if(embedded.valid()) {
+                         firmwarePorts=embedded;source=1;
+                         publishBytes(pci,"TGLVBT",bytes+0x400,firmwarePorts.bytes);
+@@ -53,6 +64,12 @@ void XE::xelpReadFirmware(IOPCIDevice *pci) {
+         firmwarePorts.present,firmwarePorts.unmapped,firmwarePorts.ambiguous,hdmi.valid,hdmi.hdmi,
+         hdmi.ddc[0],hdmi.ddc[1],hdmi.ddc[2]};
+     pci->setProperty("WhateverXeFirmwarePorts",summary,sizeof(summary));
++    // AI 修改: expose duplicate-DDI resolution details without changing the
++    // existing FirmwarePorts schema.
++    uint32_t conflicts[]={1,firmwarePorts.duplicates,firmwarePorts.conflictMask,
++        static_cast<uint32_t>(conflictPolicy),static_cast<uint32_t>(firmwarePorts.status),
++        firmwarePorts.present,firmwarePorts.unmapped,firmwarePorts.ambiguous};
++    pci->setProperty("WhateverXeFirmwareConflicts",conflicts,sizeof(conflicts));
+     pci->setProperty("WhateverXeFirmwareChecksum",firmwarePorts.checksum,32);
+     pci->setProperty("WhateverXeFirmwarePortRecords",firmwarePorts.port,sizeof(firmwarePorts.port));
+     const auto &panel=firmwarePorts.panel;
+diff --git a/WhateverXe/kern_vbt.hpp b/WhateverXe/kern_vbt.hpp
+index a8022a2..c6445d5 100644
+--- a/WhateverXe/kern_vbt.hpp
++++ b/WhateverXe/kern_vbt.hpp
+@@ -13,6 +13,10 @@ inline uint16_t u16(const uint8_t *p) {return uint16_t(uint16_t(p[0]) | uint16_t
+ inline uint32_t u32(const uint8_t *p) {return uint32_t(u16(p)) | uint32_t(u16(p+2))<<16;}
+ inline uint64_t u64(const uint8_t *p) {return uint64_t(u32(p)) | uint64_t(u32(p+4))<<32;}
+ enum class Status : uint32_t { Missing, Valid, Header, Checksum, Blocks, Version, Children, Conflict, Platform };
++// AI 修改: explicit policy for duplicate-DDI VBT entries. Reject keeps the
++// original fail-closed behavior; SelectFirst/SelectLast are opt-in escapes
++// that choose one firmware child and still report the duplicates.
++enum class ConflictPolicy : uint32_t { Reject, SelectFirst, SelectLast };
+ struct Port {
+     uint32_t type {},dvo {},ddc {},aux {},flags {},capabilities {};
+     uint32_t hdmiPreset {UINT32_MAX}; // BDB child byte7, table index; absent firmware uses default.
+@@ -27,6 +31,8 @@ struct Port {
+ struct Ports {
+     Status status {Status::Missing};
+     uint32_t version {},bytes {},present {},unmapped {},ambiguous {};
++    // AI 修改: duplicate-DDI diagnostics when a select policy resolves a conflict.
++    uint32_t duplicates {},conflictMask {};
+     uint32_t checksum {};
+     struct Panel {
+         bool valid {},lowSwing {},hobl {};
+@@ -107,7 +113,7 @@ inline void panelFacts(const uint8_t *b,size_t header,size_t size,Ports &ports)
+         if(b[at]==44){duplicate|=power!=nullptr;power=block;powerSize=n;}
+         at+=3+n;
+     }
+-    if(duplicate || !options || optionsSize<1 || options[0]>=16 ||
++    if(duplicate || !options || optionsSize<1 ||
+        !edp || edpSize<212 || (ports.version>=232 && (!power || powerSize<56)))return;
+     unsigned internal=PortCount;
+     for(unsigned d=0;d<PortCount;++d)if((ports.present&(1U<<d)) &&
+@@ -117,7 +123,14 @@ inline void panelFacts(const uint8_t *b,size_t header,size_t size,Ports &ports)
+     }
+     if(internal==PortCount)return;
+     auto &p=ports.panel;
+-    p.type=options[0];p.ddi=internal;
++    // WEX-A788: the ASUS RPL-HX firmware reports BDB40[0]=0xFF, which is not a
++    // PPS index. Stock 0.8.0 drops every panel fact on that value, so the
++    // -wex-edp-fix-training block never installs and the internal AUX power
++    // well is never repaired. An out-of-range value falls back to panel type 0:
++    // on this VBT BDB27 type 0 carries valid delays (200/100/200/50/500 ms) and
++    // BDB43 type 0 reports pwmPresent=1, backlightType=2, controller=0, which is
++    // exactly what XELP::PanelPower::nativePPS0() requires.
++    p.type=(options[0]<16)?options[0]:0;p.ddi=internal;
+     p.lowSwing=((u64(edp+204)>>(4*p.type))&15)==0;
+     p.hobl=ports.version>=232 && (u16(power+54)&(1U<<p.type));
+     p.valid=true;
+@@ -144,7 +157,8 @@ inline uint32_t ddi(Family family,uint32_t dvo) {
+     }
+     return PortCount;
+ }
+-inline Ports parse(const void *data,size_t length,Family family) {
++inline Ports parse(const void *data,size_t length,Family family,
++                   ConflictPolicy conflict=ConflictPolicy::Reject) {
+     Ports r;
+     if(!data || !length)return r;
+     if(displayAdapter(family)==DisplayAdapter::Unknown){r.status=Status::Platform;return r;}
+@@ -187,9 +201,14 @@ inline Ports parse(const void *data,size_t length,Family family) {
+         if(!(type&2))continue;
+         const auto d=ddi(family,c[16]);
+         if(d==PortCount){++r.unmapped;continue;}
+-        if(r.present&(1U<<d)){r.status=Status::Conflict;return r;}
++        if(r.present&(1U<<d)) {
++            ++r.duplicates;r.conflictMask|=1U<<d;
++            if(conflict==ConflictPolicy::Reject){r.status=Status::Conflict;return r;}
++            if(conflict==ConflictPolicy::SelectFirst)continue;
++        }
+         auto &q=r.port[d];q.type=type;q.dvo=c[16];q.ddc=c[19];q.aux=c[25];q.flags=c[23];q.capabilities=c[33];q.hdmiPreset=c[7]&31;
+         r.present|=1U<<d;
++        r.ambiguous&=~(1U<<d);
+         if(!q.fixedTMDS())r.ambiguous|=1U<<d;
+     }
+     r.status=Status::Valid;panelFacts(b,bh,bs,r);return r;
+diff --git a/WhateverXe/kern_xe.cpp b/WhateverXe/kern_xe.cpp
+index b18630b..8405637 100644
+--- a/WhateverXe/kern_xe.cpp
++++ b/WhateverXe/kern_xe.cpp
+@@ -13588,6 +13588,18 @@ uint32_t XE::wrapDisplay13PanelPower(void *controller,uint32_t state) {
+ 
+ // Shared exact-donor panel corrections; physical adapters own admission.
+ void XE::processNativePanel(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
++ // AI 修改: this board reports as RPL-HX, so selectProfile() lands on the ADL-S
++ // display adapter while the TGL donor framebuffer still drives the panel. The
++ // internal eDP repair below was gated on adapter==TGL only, so on this machine
++ // it never installed at all (no TGLEDPTrainingFix property, AUX power well
++ // never repaired). Admit the ADL-S adapter whenever the firmware really
++ // describes one internal eDP panel on the native PPS0 backend, and let that
++ // same switch keep the ADL-S PWM-only wrapper from claiming LightUpEDP.
++ const auto panelAdapter=XELP::displayAdapter(xeProfile.family);
++ const bool edpPanelFix=tglActive && !display13FramebufferRequested &&
++   (panelAdapter==XELP::DisplayAdapter::TGL || panelAdapter==XELP::DisplayAdapter::ADLS) &&
++   XELP::PanelPower::nativePPS0(firmwarePorts,xeProfile.family);
++ IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPPanelFix",edpPanelFix);
+ 			{
+ 				// getDPCDInfo stores MAX_LANE_COUNT bit7 at port+0x10,
+ 				// but setupPort defaults enhanced framing to !MST.
+@@ -13667,9 +13679,13 @@ void XE::processNativePanel(KernelPatcher &patcher,size_t index,mach_vm_address_
+      !memcmp(reinterpret_cast<void *>(lightFn),lightEntry,sizeof(lightEntry)) &&
+      !memcmp(reinterpret_cast<void *>(brightnessFn),brightnessEntry,sizeof(brightnessEntry)) &&
+      !memcmp(reinterpret_cast<void *>(address+0x507e9),enable,sizeof(enable));
++    // AI 修改: when the internal eDP repair owns LightUpEDP, keep only the
++    // ADL-S PWM duty/enable adapters. The sink reset and the DDI/PG power-well
++    // repair must not lose the LightUpEDP hook to the ADL-S panel wrapper.
++    const bool pwmOnly=edpPanelFix;
+     KernelPatcher::RouteRequest routes[] {{light,wrapADLSLightUpEDP,orgADLSLightUpEDP},
+      {brightness,wrapADLSPanelBacklight,orgADLSPanelBacklight}};
+-    if(known && patcher.routeMultiple(index,routes,2,address,size)) {
++    if(known && patcher.routeMultiple(index,routes+(pwmOnly?1:0),pwmOnly?1:2,address,size)) {
+      uint8_t bridge[]={0x48,0xb8,0,0,0,0,0,0,0,0,0xff,0xd0,0x90,0x90,0x90,0x90};
+      const auto handler=reinterpret_cast<uintptr_t>(wrapADLSPanelPWMEnable);memcpy(bridge+2,&handler,sizeof(handler));
+      patcher.routeBlock(address+0x507e9,bridge,sizeof(bridge));
+@@ -13746,6 +13762,64 @@ void XE::processNativePanel(KernelPatcher &patcher,size_t index,mach_vm_address_
+ 				IORegistryEntry::getRegistryRoot()->setProperty("TGLEDPTranscoderReady",ready);
+ 				patcher.clearError();
+ 			}
++ // AI 修改: internal eDP sink reset. Install an independent LightUpEDP hook and
++ // retain the donor PPS entry; no Tahoe path is enabled or required. Display13
++ // owns its own routes, so this binds only the Combo eDP path.
++ if(edpPanelFix) {
++  // AI 修改: the eDP fix is a single opt-in switch. -wex-edp-fix-training runs
++  // both stages before the native internal LightUpEDP: the PPS off/T12/on sink
++  // reset and the DDI/PG power-domain repair.
++  const bool trainingFix=checkKernelArgument("-wex-edp-fix-training");
++  auto root=IORegistryEntry::getRegistryRoot();
++  root->setProperty("TGLEDPTrainingFix",trainingFix);
++  if(trainingFix) {
++  // AI 修改: resolve the donor DDI/PG/AUX power-well entries.
++  const char *auxOn="__ZN19AppleIntelPowerWell18enablePowerWellAuxEj";
++  const char *auxOff="__ZN19AppleIntelPowerWell19disablePowerWellAuxEj";
++  const char *ddiOn="__ZN19AppleIntelPowerWell18enablePowerWellDDIEj";
++  const char *ddiOff="__ZN19AppleIntelPowerWell19disablePowerWellDDIEj";
++  const char *engine="__ZN19AppleIntelPowerWell19enableDisplayEngineEv";
++  const auto auxOnFn=patcher.solveSymbol(index,auxOn,address,size);patcher.clearError();
++  const auto auxOffFn=patcher.solveSymbol(index,auxOff,address,size);patcher.clearError();
++  const auto ddiOnFn=patcher.solveSymbol(index,ddiOn,address,size);patcher.clearError();
++  const auto ddiOffFn=patcher.solveSymbol(index,ddiOff,address,size);patcher.clearError();
++  const auto engineFn=patcher.solveSymbol(index,engine,address,size);patcher.clearError();
++  tglEDPPowerDomainReady=auxOnFn==address+0x5C4BA && auxOffFn==address+0x5AE0A &&
++   ddiOnFn==address+0x5BFA8 && ddiOffFn==address+0x5AA86 && engineFn==address+0x5A6A8 &&
++   size>0x5CA12;
++  if(tglEDPPowerDomainReady){
++   tglPowerWellEnableAux=auxOnFn;tglPowerWellDisableAux=auxOffFn;
++   tglPowerWellEnableDDI=ddiOnFn;tglPowerWellDisableDDI=ddiOffFn;
++   tglPowerWellEnableEngine=engineFn;
++  }
++  root->setProperty("TGLEDPPowerDomainReady",tglEDPPowerDomainReady);
++  const char *edp="__ZN31AppleIntelFramebufferController10LightUpEDPEP21AppleIntelFramebufferP21AppleIntelDisplayPathPK29IODetailedTimingInformationV2";
++  const uint8_t lightEntry[]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x50,0x49,0x89,0xcf};
++  const auto lightFn=patcher.solveSymbol(index,edp,address,size);patcher.clearError();
++  bool ready=size>=0x508c4 && lightFn==address+0x5063e &&
++   !memcmp(reinterpret_cast<void *>(lightFn),lightEntry,sizeof(lightEntry));
++  // AI 修改: never collide with another already-installed LightUpEDP route.
++  if(ready && !orgADLSLightUpEDP && !orgTGLPanelLightUp) {
++   KernelPatcher::RouteRequest route(edp,wrapTGLPanelLightUp,orgTGLPanelLightUp);
++   ready=patcher.routeMultiple(index,&route,1,address,size);
++   patcher.clearError();
++  }
++  tglPanelLightUpReady=ready && orgTGLPanelLightUp;
++  root->setProperty("TGLPanelLightUpReady",tglPanelLightUpReady);
++  // AI 修改: retain the donor PPS entry used for the sink reset.
++  const char *pps="__ZN31AppleIntelFramebufferController15hwSetPanelPowerEj";
++  const uint8_t ppsEntry[]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x53,0x48,0x83,0xec,0x28,0x89,0xf3,0x49,0x89,0xff};
++  const uint8_t ppsConfig[]={0x8b,0xb7,0x48,0x0d,0x00,0x00,0xe8,0x30,0xb1,0xff,0xff,0x83,0xfb,0x02};
++  const auto ppsFn=patcher.solveSymbol(index,pps,address,size);patcher.clearError();
++  tglPanelPowerFunctionReady=ppsFn==address+0x48652 && size>0x48B88 &&
++   !memcmp(reinterpret_cast<void *>(ppsFn),ppsEntry,sizeof(ppsEntry)) &&
++   !memcmp(reinterpret_cast<void *>(address+0x4866b),ppsConfig,sizeof(ppsConfig));
++  if(tglPanelPowerFunctionReady)tglPanelPowerFunction=ppsFn;
++  root->setProperty("TGLPanelPowerFunctionReady",tglPanelPowerFunctionReady);
++  }
++  tglEDPTrainingFixReady=trainingFix && tglPanelPowerFunctionReady && tglPanelLightUpReady;
++  root->setProperty("TGLEDPTrainingFixReady",tglEDPTrainingFixReady);
++ }
+ }
+ 
+ // Retain hwSetPanelPowerConfig's caller-serialization contract. The wrapper
+@@ -18685,9 +18759,44 @@ uint32_t XE::wrapTGLPortTraining(void *port, void *request) {
+ 	auto caller = __builtin_return_address(0);
+ 	tglObservePath(port, nullptr, 0, false, 0, request != nullptr, caller);
+ 	const auto token = tglTrainingScopes.enter(reinterpret_cast<uintptr_t>(current_thread()));
++	// AI 修改: measure the native link-training duration and outcome.
++	uint64_t trainStart {}, trainEnd {};
++	clock_get_uptime(&trainStart);
+ 	const auto r = FunctionCast(wrapTGLPortTraining, callbackXE->orgTGLPortTraining)(port, request);
++	clock_get_uptime(&trainEnd);
+ 	tglTrainingScopes.leave(token);
+  tglAUXRecord(port,10,true,r,0,0);
++	// AI 修改: diagnostics only; no behavior change.
++	{
++		uint64_t aNs {}, bNs {};
++		absolutetime_to_nanoseconds(trainStart, &aNs);
++		absolutetime_to_nanoseconds(trainEnd, &bNs);
++		const uint64_t ns = bNs >= aNs ? bNs - aNs : 0;
++		static uint32_t timingSeq;
++		const auto seq = __sync_add_and_fetch(&timingSeq, 1);
++		auto p = static_cast<uint8_t *>(port);
++		auto cfg = p ? *reinterpret_cast<uint32_t **>(p + 0x548) : nullptr;
++		const uint32_t ddi = cfg ? cfg[0] : UINT32_MAX;
++		const uint32_t lanes = p ? *reinterpret_cast<uint32_t *>(p + 0x124) : 0;
++		const uint32_t rate = p ? *reinterpret_cast<uint32_t *>(p + 0x128) : 0;
++		const uint32_t mode = p ? *reinterpret_cast<uint32_t *>(p + 0x550) : 0;
++		uint32_t rec[] = {1, seq, r, static_cast<uint32_t>(ns / 1000000), ddi,
++		                  lanes, rate, mode, static_cast<uint32_t>(ns % 1000000), 0};
++		auto root = IORegistryEntry::getRegistryRoot();
++		char key[48];
++		snprintf(key, sizeof(key), "TGLTrainingTimeLast%u", seq % 16);
++		root->setProperty(key, rec, sizeof(rec));
++		if (seq <= 16) {
++			snprintf(key, sizeof(key), "TGLTrainingTimeFirst%u", seq);
++			root->setProperty(key, rec, sizeof(rec));
++		}
++		root->setProperty("TGLTrainingTime", rec, sizeof(rec));
++		if (!r) {
++			uint32_t ok[] = {1, seq, static_cast<uint32_t>(ns / 1000000),
++			                 static_cast<uint32_t>(ns % 1000000), ddi};
++			root->setProperty("TGLTrainingSuccess", ok, sizeof(ok));
++		}
++	}
+ 	SYSLOG("igfx", "TGL330 port-training return result=%x", r);
+ 	static uint32_t count {};
+ 	IORegistryEntry::getRegistryRoot()->setProperty("TGLQuietTrainingCalls",
+@@ -18714,6 +18823,112 @@ void XE::wrapTGLFreePath(void *path) {
+ 	tglObservePath(port, path, 2, true, 0, 0, caller);
+ }
+ 
++// AI 修改: internal panel DDI for the eDP fix. Unlike tglPanelDepthPort this
++// does not require the port to be active (+0x117), because the fix may run
++// during a wake or teardown transition.
++uint32_t XE::tglPanelAuxDDI(void *port) {
++ auto s=callbackXE;auto p=static_cast<uint8_t *>(port);
++ auto c=static_cast<uint8_t *>(s->tglObservationController);
++ if(!p || !c || !s->tglActive)return 9;
++ auto cfg=*reinterpret_cast<uint32_t **>(p+0x548);
++ if(!cfg || cfg[0]>1 || cfg[2]!=0 || cfg[3]!=0)return 9;
++ if(!s->firmwarePorts.valid() || !(s->firmwarePorts.present&(1U<<cfg[0])) ||
++    !s->firmwarePorts.port[cfg[0]].internal() || !s->firmwarePorts.port[cfg[0]].dp())return 9;
++ return cfg[0];
++}
++
++// AI 修改: DDI/PG power-domain repair (part of -wex-edp-fix-training). The
++// display-sleep path can leave the DDI/AUX power-well references stale, so the
++// donor's own enable entries skip the hardware. Drain those references, run
++// the donor's display engine/PG enable sequence, then enable the panel DDI and
++// AUX once. The display-engine step intentionally bypasses the PG reference
++// short-circuit.
++void XE::tglPowerDomainRepair(void *controller,uint32_t ddi) {
++ auto s=callbackXE;auto ctl=static_cast<uint8_t *>(controller);
++ if(!s->tglEDPPowerDomainReady || !ctl || ctl!=s->tglObservationController || ddi>1)return;
++ auto power=*reinterpret_cast<uint8_t **>(ctl+0xC8);
++ auto access=*reinterpret_cast<void **>(ctl+0xC40);
++ if(!power || *reinterpret_cast<void **>(power+0x10)!=controller ||
++    *reinterpret_cast<void **>(power+0x78)!=access)return;
++ using RefFn=void (*)(void *,uint32_t);
++ using EngineFn=void (*)(void *);
++ const auto enableAux=reinterpret_cast<RefFn>(s->tglPowerWellEnableAux);
++ const auto disableAux=reinterpret_cast<RefFn>(s->tglPowerWellDisableAux);
++ const auto enableDDI=reinterpret_cast<RefFn>(s->tglPowerWellEnableDDI);
++ const auto disableDDI=reinterpret_cast<RefFn>(s->tglPowerWellDisableDDI);
++ const auto engine=reinterpret_cast<EngineFn>(s->tglPowerWellEnableEngine);
++ if(!enableAux || !disableAux || !enableDDI || !disableDDI || !engine)return;
++ const auto read=[&](uint32_t reg)->uint32_t {return s->orgTGLRegisterRead ?
++   FunctionCast(wrapTGLRegisterRead,s->orgTGLRegisterRead)(access,reg) : UINT32_MAX;};
++ auto &ddiRef=*reinterpret_cast<volatile uint32_t *>(power+0x30+4*ddi);
++ auto &auxRef=*reinterpret_cast<volatile uint32_t *>(power+0x54+4*ddi);
++ // {4, ddi, ddiBefore, auxBefore, ddiDrained, auxDrained, engineCalled,
++ //  ddiAfter, auxAfter, mainBefore, ioBefore, mainAfter, ioAfter, suspended, 0, 0}
++ uint32_t rec[16] {};
++ rec[0]=4;rec[1]=ddi;rec[2]=ddiRef;rec[3]=auxRef;
++ rec[9]=read(0x45404);rec[10]=read(0x45454);
++ uint32_t ddiDrained=0,auxDrained=0;
++ while(ddiRef && ddiDrained<16) {disableDDI(power,ddi);++ddiDrained;}
++ while(auxRef && auxDrained<16) {disableAux(power,ddi);++auxDrained;}
++ rec[4]=ddiDrained;rec[5]=auxDrained;
++ engine(power);
++ rec[6]=1;
++ enableDDI(power,ddi);rec[7]=ddiRef;
++ enableAux(power,ddi);rec[8]=auxRef;
++ rec[11]=read(0x45404);rec[12]=read(0x45454);
++ rec[13]=power[0x18];
++ IORegistryEntry::getRegistryRoot()->setProperty("TGLEDPPowerDomainLast",rec,sizeof(rec));
++}
++
++// AI 修改: independent internal eDP sink reset. No Tahoe route is used here:
++// the donor's own hwSetPanelPower entry cycles the panel supply before the
++// native internal LightUpEDP, mirroring a proven display sleep/wake so the
++// sink link/scrambler state is re-initialized. It runs before every internal
++// light-up (cold boot and each wake) and never changes the native result.
++uint32_t XE::wrapTGLPanelLightUp(void *controller,void *fb,void *path,const void *timing) {
++ auto self=callbackXE;auto ctl=static_cast<uint8_t *>(controller);
++ auto pb=path?*reinterpret_cast<uint8_t **>(static_cast<uint8_t *>(path)+0x3648):nullptr;
++ auto cfg=pb?*reinterpret_cast<uint32_t **>(pb+0x548):nullptr;
++ auto access=ctl?*reinterpret_cast<void **>(ctl+0xC40):nullptr;
++ // AI 修改: cycle only the qualified internal panel path.
++ if(self->tglEDPTrainingFixReady && self->tglPanelPowerFunctionReady && self->tglPanelPowerFunction &&
++    self->orgTGLRegisterRead && ctl==self->tglObservationController && access &&
++    fb==*reinterpret_cast<void **>(ctl+0xD60) && cfg && cfg[0]==0 && cfg[2]==0 && cfg[3]==0) {
++  const auto read=FunctionCast(wrapTGLRegisterRead,self->orgTGLRegisterRead);
++  static uint32_t cycleSeq;
++  // {2, seq, statusBefore, controlBefore, surface, mainPower, ioPower,
++  //  offResult, t12, onResult, statusAfter, 0}
++  uint32_t rec[12] {};
++  rec[0]=2;rec[1]=__sync_add_and_fetch(&cycleSeq,1);
++  rec[2]=read(access,0xC7200);rec[3]=read(access,0xC7204);
++  rec[4]=read(access,0x7019C);rec[5]=read(access,0x45404);rec[6]=read(access,0x45454);
++  using PanelPowerFn=uint32_t (*)(void *,uint32_t);
++  const auto panel=reinterpret_cast<PanelPowerFn>(self->tglPanelPowerFunction);
++  rec[7]=panel(ctl,0);
++  uint32_t t12=*reinterpret_cast<uint32_t *>(ctl+0x1558);
++  if(!t12 || t12>31)t12=6;
++  // AI 修改: donor T12 is expressed in 100 ms units; add 100 ms margin.
++  rec[8]=t12;
++  IOSleep(t12*100+100);
++  rec[9]=panel(ctl,2);
++  rec[10]=read(access,0xC7200);
++  auto root=IORegistryEntry::getRegistryRoot();
++  root->setProperty("TGLPanelCycle",rec,sizeof(rec));
++  if(!self->tglColdPanelCycleDone) {
++   self->tglColdPanelCycleDone=true;
++   root->setProperty("TGLPanelColdCycle",rec,sizeof(rec));
++  }
++ }
++ // AI 修改: DDI/PG power-domain repair, as late as possible before the native
++ // light-up.
++ if(self->tglEDPTrainingFixReady && self->tglEDPPowerDomainReady) {
++  const auto ddi=tglPanelAuxDDI(pb);
++  if(ddi<=1)tglPowerDomainRepair(controller,ddi);
++ }
++ // AI 修改: always run the native light-up and keep its result unchanged.
++ return FunctionCast(wrapTGLPanelLightUp,self->orgTGLPanelLightUp)(controller,fb,path,timing);
++}
++
+ uint32_t XE::wrapTGLLightUpDP(void *controller, void *fb, void *path, const void *timing) {
+  auto port=path?*reinterpret_cast<void **>(static_cast<uint8_t *>(path)+0x3648):nullptr;
+  tglAUXRecord(port,11,false,0,0,0);
+diff --git a/WhateverXe/kern_xe.hpp b/WhateverXe/kern_xe.hpp
+index d333a30..ea6d862 100644
+--- a/WhateverXe/kern_xe.hpp
++++ b/WhateverXe/kern_xe.hpp
+@@ -538,6 +538,22 @@ private:
+  static uint32_t wrapTGLPanelTiming(void *controller);
+ 	static uint32_t tglPanelDepthPort(void *port);
+ 	static void wrapTGLModeTiming(void *controller,void *fb,void *timing);
++	// AI 修改: internal eDP fix, enabled by -wex-edp-fix-training. The
++	// LightUpEDP hook runs the donor's PPS off/T12/on sink reset and the
++	// DDI/PG power-domain repair before the native internal light-up.
++	bool tglPanelLightUpReady {};
++	mach_vm_address_t orgTGLPanelLightUp {};
++	mach_vm_address_t tglPanelPowerFunction {};
++	bool tglPanelPowerFunctionReady {},tglColdPanelCycleDone {};
++	bool tglEDPTrainingFixReady {};
++	static uint32_t wrapTGLPanelLightUp(void *controller, void *fb, void *path, const void *timing);
++	// AI 修改: DDI/PG power-domain repair, part of -wex-edp-fix-training.
++	bool tglEDPPowerDomainReady {};
++	mach_vm_address_t tglPowerWellEnableAux {},tglPowerWellDisableAux {};
++	mach_vm_address_t tglPowerWellEnableDDI {},tglPowerWellDisableDDI {};
++	mach_vm_address_t tglPowerWellEnableEngine {};
++	static uint32_t tglPanelAuxDDI(void *port);
++	static void tglPowerDomainRepair(void *controller,uint32_t ddi);
+ 	mach_vm_address_t orgTGLGamma10 {}, orgTGLRegisterWrite {}, orgTGLFastRegisterWrite {};
+ 	static void wrapTGLGamma10(void *path, void *transaction, uint32_t control);
+ 	static void wrapTGLRegisterWrite(void *access, unsigned long reg, uint32_t value);

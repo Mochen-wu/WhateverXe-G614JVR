@@ -13,6 +13,10 @@ inline uint16_t u16(const uint8_t *p) {return uint16_t(uint16_t(p[0]) | uint16_t
 inline uint32_t u32(const uint8_t *p) {return uint32_t(u16(p)) | uint32_t(u16(p+2))<<16;}
 inline uint64_t u64(const uint8_t *p) {return uint64_t(u32(p)) | uint64_t(u32(p+4))<<32;}
 enum class Status : uint32_t { Missing, Valid, Header, Checksum, Blocks, Version, Children, Conflict, Platform };
+// AI 修改: explicit policy for duplicate-DDI VBT entries. Reject keeps the
+// original fail-closed behavior; SelectFirst/SelectLast are opt-in escapes
+// that choose one firmware child and still report the duplicates.
+enum class ConflictPolicy : uint32_t { Reject, SelectFirst, SelectLast };
 struct Port {
     uint32_t type {},dvo {},ddc {},aux {},flags {},capabilities {};
     uint32_t hdmiPreset {UINT32_MAX}; // BDB child byte7, table index; absent firmware uses default.
@@ -27,6 +31,8 @@ struct Port {
 struct Ports {
     Status status {Status::Missing};
     uint32_t version {},bytes {},present {},unmapped {},ambiguous {};
+    // AI 修改: duplicate-DDI diagnostics when a select policy resolves a conflict.
+    uint32_t duplicates {},conflictMask {};
     uint32_t checksum {};
     struct Panel {
         bool valid {},lowSwing {},hobl {};
@@ -107,7 +113,7 @@ inline void panelFacts(const uint8_t *b,size_t header,size_t size,Ports &ports) 
         if(b[at]==44){duplicate|=power!=nullptr;power=block;powerSize=n;}
         at+=3+n;
     }
-    if(duplicate || !options || optionsSize<1 || options[0]>=16 ||
+    if(duplicate || !options || optionsSize<1 ||
        !edp || edpSize<212 || (ports.version>=232 && (!power || powerSize<56)))return;
     unsigned internal=PortCount;
     for(unsigned d=0;d<PortCount;++d)if((ports.present&(1U<<d)) &&
@@ -117,7 +123,14 @@ inline void panelFacts(const uint8_t *b,size_t header,size_t size,Ports &ports) 
     }
     if(internal==PortCount)return;
     auto &p=ports.panel;
-    p.type=options[0];p.ddi=internal;
+    // WEX-A788: the ASUS RPL-HX firmware reports BDB40[0]=0xFF, which is not a
+    // PPS index. Stock 0.8.0 drops every panel fact on that value, so the
+    // -wex-edp-fix-training block never installs and the internal AUX power
+    // well is never repaired. An out-of-range value falls back to panel type 0:
+    // on this VBT BDB27 type 0 carries valid delays (200/100/200/50/500 ms) and
+    // BDB43 type 0 reports pwmPresent=1, backlightType=2, controller=0, which is
+    // exactly what XELP::PanelPower::nativePPS0() requires.
+    p.type=(options[0]<16)?options[0]:0;p.ddi=internal;
     p.lowSwing=((u64(edp+204)>>(4*p.type))&15)==0;
     p.hobl=ports.version>=232 && (u16(power+54)&(1U<<p.type));
     p.valid=true;
@@ -144,7 +157,8 @@ inline uint32_t ddi(Family family,uint32_t dvo) {
     }
     return PortCount;
 }
-inline Ports parse(const void *data,size_t length,Family family) {
+inline Ports parse(const void *data,size_t length,Family family,
+                   ConflictPolicy conflict=ConflictPolicy::Reject) {
     Ports r;
     if(!data || !length)return r;
     if(displayAdapter(family)==DisplayAdapter::Unknown){r.status=Status::Platform;return r;}
@@ -187,9 +201,14 @@ inline Ports parse(const void *data,size_t length,Family family) {
         if(!(type&2))continue;
         const auto d=ddi(family,c[16]);
         if(d==PortCount){++r.unmapped;continue;}
-        if(r.present&(1U<<d)){r.status=Status::Conflict;return r;}
+        if(r.present&(1U<<d)) {
+            ++r.duplicates;r.conflictMask|=1U<<d;
+            if(conflict==ConflictPolicy::Reject){r.status=Status::Conflict;return r;}
+            if(conflict==ConflictPolicy::SelectFirst)continue;
+        }
         auto &q=r.port[d];q.type=type;q.dvo=c[16];q.ddc=c[19];q.aux=c[25];q.flags=c[23];q.capabilities=c[33];q.hdmiPreset=c[7]&31;
         r.present|=1U<<d;
+        r.ambiguous&=~(1U<<d);
         if(!q.fixedTMDS())r.ambiguous|=1U<<d;
     }
     r.status=Status::Valid;panelFacts(b,bh,bs,r);return r;

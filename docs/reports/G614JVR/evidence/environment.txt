@@ -1,0 +1,59 @@
+# Environment snapshot — ASUS ROG Strix G16 (G614JVR)
+# Captured: 2026-11-11 17:42:48 CST
+
+## macOS
+ProductName:		macOS
+ProductVersion:		26.7.2
+BuildVersion:		25G332
+
+## CPU
+Intel(R) Core(TM) i9-14900HX
+
+## boot-args
+-allow3d -disablegfxfirmware -vi2c-force-polling ctrsmt=full nvfb=1 nvaccel=1 nvfbheads=4 -nvkmsnosmooth amfi_get_out_of_my_way=0x1 gfxrst=4 itlwm_he=1 ssvdisable nvrmacpibl=1 -btlfxboardid -ibtcompatbeta amfi=0x80 ipc_control_port_options=0 -wex-edp-fix-training -wex-ddi-conflict-select-first
+
+## Loaded graphics stack
+   69    0 0xffffff8004f87000 0x927000   0x927000   org.b00t0x.WhateverXe (0.8.0) 5FF4471C-6276-368B-B394-64724B804AA7 <56 19 9 7 6 3 2 1>
+  140    1 0xffffff7f96d2e000 0x23f4     0x23f4     org.b00t0x.AppleIntelTGLCompat (0.8.0) F6997294-0598-30BD-98B3-38E0EEB2FA7E <19 9 7 6 3 2 1>
+  141    0 0xffffff7f96e7e000 0xc8000    0xc8000    com.apple.driver.AppleIntelTGLGraphicsFramebuffer (16.0.0) B6078743-F795-3202-A55E-EA690FA40949 <140 139 138 122 48 19 17 9 8 7 6 3 1>
+  145    0 0xffffff7f981e6000 0x33ca2    0x33ca2    com.nullmoth.NVRMFB (2.9) 0D1B142F-10FB-3CD0-BFB0-D2448A73B9AC <122 19 7 6 3 1>
+  148    0 0xffffff7f97277000 0xe1dbdc   0xe1dbdc   com.nullmoth.NVRM (2.9) E8777EA1-6C6F-3D87-A1E9-666081FB3D6E <19 17 9 7 6 3 1>
+  149    0 0xffffff7f96d32000 0xc7ff9    0xc7ff9    com.apple.driver.AppleIntelTGLGraphics (16.0.0) BA3AA1C0-FE6B-33B3-9D85-73F848394E3D <139 122 104 19 9 8 7 6 3 1>
+  150    0 0xffffff7f9724f000 0x1b818    0x1b818    com.nullmoth.NVAccel (2.9) 3ABA0A71-7446-3091-B185-E988728F5C35 <139 122 104 19 7 6 3 1>
+  166    0 0xffffff7f981e1000 0x2f65     0x2f65     com.nullmoth.NVRMAGDC (2.9) 24AFEA31-7AD9-3379-BBA9-3AD85E2B8CD5 <138 7 6 3 1>
+
+## Displays
+Graphics/Displays:
+
+    Intel UHD Graphics:
+
+      Chipset Model: Intel UHD Graphics
+      Type: GPU
+      Bus: Built-In
+      VRAM (Dynamic, Max): 1536 MB
+      Vendor: Intel
+      Device ID: 0xa788
+      Revision ID: 0x0004
+      Metal Support: Metal 2
+      Displays:
+        TL160ADMP16-0:
+          Resolution: 2560 x 1600
+          UI Looks like: 1280 x 800
+          Framebuffer Depth: 24-Bit Color (ARGB8888)
+          Main Display: Yes
+          Mirror: Off
+          Online: Yes
+          Connection Type: Internal
+
+    NVIDIA GeForce RTX 4060 Laptop GPU:
+
+      Chipset Model: NVIDIA GeForce RTX 4060 Laptop GPU
+      Type: GPU
+      Bus: PCIe
+      PCIe Lane Width: x8
+      VRAM (Total): 8 GB
+      Vendor: NVIDIA (0x10de)
+      Device ID: 0x28e0
+      Revision ID: 0x00a1
+      Metal Support: Metal 4
+

@@ -13,6 +13,17 @@ static void publishBytes(IOPCIDevice *pci,const char *key,const void *bytes,unsi
 void XE::xelpReadFirmware(IOPCIDevice *pci) {
     // Wiring is needed by framebuffer-only profiles before Render is admitted.
     if(!pci || !xeProfile.displayAdmitted())return;
+    // AI 修改: explicit duplicate-DDI policy. Default remains fail-closed;
+    // the two switches are opt-in escapes for firmware tables that list more
+    // than one child for the same physical DDI.
+    XELP::VBT::ConflictPolicy conflictPolicy=XELP::VBT::ConflictPolicy::Reject;
+    const bool conflictFirst=checkKernelArgument("-wex-ddi-conflict-select-first");
+    const bool conflictLast=checkKernelArgument("-wex-ddi-conflict-select-last");
+    if(conflictFirst && !conflictLast)conflictPolicy=XELP::VBT::ConflictPolicy::SelectFirst;
+    else if(conflictLast && !conflictFirst)conflictPolicy=XELP::VBT::ConflictPolicy::SelectLast;
+    else if(conflictFirst && conflictLast)
+        SYSLOG("igfx","TGL DDI conflict: both select switches set; keeping reject");
+    pci->setProperty("TGLDDIConflictPolicy",static_cast<uint32_t>(conflictPolicy),32);
     const uint32_t asls=pci->configRead32(0xFC);
     uint32_t source=0;
     if(asls && asls<=0xFFFFE000U) {
@@ -30,14 +41,14 @@ void XE::xelpReadFirmware(IOPCIDevice *pci) {
                     auto vbtMap=vbtMemory ? vbtMemory->map(kIOMapReadOnly) : nullptr;
                     if(vbtMap && vbtMap->getVirtualAddress() && vbtMap->getLength()>=region.bytes) {
                         const auto data=reinterpret_cast<const void *>(vbtMap->getVirtualAddress());
-                        firmwarePorts=XELP::VBT::parse(data,region.bytes,xeProfile.family);
+                        firmwarePorts=XELP::VBT::parse(data,region.bytes,xeProfile.family,conflictPolicy);
                         if(firmwarePorts.valid()){source=2;publishBytes(pci,"TGLVBT",data,firmwarePorts.bytes);}
                     }
                     if(vbtMap)vbtMap->release();
                     if(vbtMemory)vbtMemory->release();
                 }
                 if(!firmwarePorts.valid()) {
-                    const auto embedded=XELP::VBT::parse(bytes+0x400,region.inlineBytes,xeProfile.family);
+                    const auto embedded=XELP::VBT::parse(bytes+0x400,region.inlineBytes,xeProfile.family,conflictPolicy);
                     if(embedded.valid()) {
                         firmwarePorts=embedded;source=1;
                         publishBytes(pci,"TGLVBT",bytes+0x400,firmwarePorts.bytes);
@@ -53,6 +64,12 @@ void XE::xelpReadFirmware(IOPCIDevice *pci) {
         firmwarePorts.present,firmwarePorts.unmapped,firmwarePorts.ambiguous,hdmi.valid,hdmi.hdmi,
         hdmi.ddc[0],hdmi.ddc[1],hdmi.ddc[2]};
     pci->setProperty("WhateverXeFirmwarePorts",summary,sizeof(summary));
+    // AI 修改: expose duplicate-DDI resolution details without changing the
+    // existing FirmwarePorts schema.
+    uint32_t conflicts[]={1,firmwarePorts.duplicates,firmwarePorts.conflictMask,
+        static_cast<uint32_t>(conflictPolicy),static_cast<uint32_t>(firmwarePorts.status),
+        firmwarePorts.present,firmwarePorts.unmapped,firmwarePorts.ambiguous};
+    pci->setProperty("WhateverXeFirmwareConflicts",conflicts,sizeof(conflicts));
     pci->setProperty("WhateverXeFirmwareChecksum",firmwarePorts.checksum,32);
     pci->setProperty("WhateverXeFirmwarePortRecords",firmwarePorts.port,sizeof(firmwarePorts.port));
     const auto &panel=firmwarePorts.panel;

@@ -13588,6 +13588,18 @@ uint32_t XE::wrapDisplay13PanelPower(void *controller,uint32_t state) {
 
 // Shared exact-donor panel corrections; physical adapters own admission.
 void XE::processNativePanel(KernelPatcher &patcher,size_t index,mach_vm_address_t address,size_t size) {
+ // AI 修改: this board reports as RPL-HX, so selectProfile() lands on the ADL-S
+ // display adapter while the TGL donor framebuffer still drives the panel. The
+ // internal eDP repair below was gated on adapter==TGL only, so on this machine
+ // it never installed at all (no TGLEDPTrainingFix property, AUX power well
+ // never repaired). Admit the ADL-S adapter whenever the firmware really
+ // describes one internal eDP panel on the native PPS0 backend, and let that
+ // same switch keep the ADL-S PWM-only wrapper from claiming LightUpEDP.
+ const auto panelAdapter=XELP::displayAdapter(xeProfile.family);
+ const bool edpPanelFix=tglActive && !display13FramebufferRequested &&
+   (panelAdapter==XELP::DisplayAdapter::TGL || panelAdapter==XELP::DisplayAdapter::ADLS) &&
+   XELP::PanelPower::nativePPS0(firmwarePorts,xeProfile.family);
+ IORegistryEntry::getRegistryRoot()->setProperty("WEXEDPPanelFix",edpPanelFix);
 			{
 				// getDPCDInfo stores MAX_LANE_COUNT bit7 at port+0x10,
 				// but setupPort defaults enhanced framing to !MST.
@@ -13667,9 +13679,13 @@ void XE::processNativePanel(KernelPatcher &patcher,size_t index,mach_vm_address_
      !memcmp(reinterpret_cast<void *>(lightFn),lightEntry,sizeof(lightEntry)) &&
      !memcmp(reinterpret_cast<void *>(brightnessFn),brightnessEntry,sizeof(brightnessEntry)) &&
      !memcmp(reinterpret_cast<void *>(address+0x507e9),enable,sizeof(enable));
+    // AI 修改: when the internal eDP repair owns LightUpEDP, keep only the
+    // ADL-S PWM duty/enable adapters. The sink reset and the DDI/PG power-well
+    // repair must not lose the LightUpEDP hook to the ADL-S panel wrapper.
+    const bool pwmOnly=edpPanelFix;
     KernelPatcher::RouteRequest routes[] {{light,wrapADLSLightUpEDP,orgADLSLightUpEDP},
      {brightness,wrapADLSPanelBacklight,orgADLSPanelBacklight}};
-    if(known && patcher.routeMultiple(index,routes,2,address,size)) {
+    if(known && patcher.routeMultiple(index,routes+(pwmOnly?1:0),pwmOnly?1:2,address,size)) {
      uint8_t bridge[]={0x48,0xb8,0,0,0,0,0,0,0,0,0xff,0xd0,0x90,0x90,0x90,0x90};
      const auto handler=reinterpret_cast<uintptr_t>(wrapADLSPanelPWMEnable);memcpy(bridge+2,&handler,sizeof(handler));
      patcher.routeBlock(address+0x507e9,bridge,sizeof(bridge));
@@ -13746,6 +13762,64 @@ void XE::processNativePanel(KernelPatcher &patcher,size_t index,mach_vm_address_
 				IORegistryEntry::getRegistryRoot()->setProperty("TGLEDPTranscoderReady",ready);
 				patcher.clearError();
 			}
+ // AI 修改: internal eDP sink reset. Install an independent LightUpEDP hook and
+ // retain the donor PPS entry; no Tahoe path is enabled or required. Display13
+ // owns its own routes, so this binds only the Combo eDP path.
+ if(edpPanelFix) {
+  // AI 修改: the eDP fix is a single opt-in switch. -wex-edp-fix-training runs
+  // both stages before the native internal LightUpEDP: the PPS off/T12/on sink
+  // reset and the DDI/PG power-domain repair.
+  const bool trainingFix=checkKernelArgument("-wex-edp-fix-training");
+  auto root=IORegistryEntry::getRegistryRoot();
+  root->setProperty("TGLEDPTrainingFix",trainingFix);
+  if(trainingFix) {
+  // AI 修改: resolve the donor DDI/PG/AUX power-well entries.
+  const char *auxOn="__ZN19AppleIntelPowerWell18enablePowerWellAuxEj";
+  const char *auxOff="__ZN19AppleIntelPowerWell19disablePowerWellAuxEj";
+  const char *ddiOn="__ZN19AppleIntelPowerWell18enablePowerWellDDIEj";
+  const char *ddiOff="__ZN19AppleIntelPowerWell19disablePowerWellDDIEj";
+  const char *engine="__ZN19AppleIntelPowerWell19enableDisplayEngineEv";
+  const auto auxOnFn=patcher.solveSymbol(index,auxOn,address,size);patcher.clearError();
+  const auto auxOffFn=patcher.solveSymbol(index,auxOff,address,size);patcher.clearError();
+  const auto ddiOnFn=patcher.solveSymbol(index,ddiOn,address,size);patcher.clearError();
+  const auto ddiOffFn=patcher.solveSymbol(index,ddiOff,address,size);patcher.clearError();
+  const auto engineFn=patcher.solveSymbol(index,engine,address,size);patcher.clearError();
+  tglEDPPowerDomainReady=auxOnFn==address+0x5C4BA && auxOffFn==address+0x5AE0A &&
+   ddiOnFn==address+0x5BFA8 && ddiOffFn==address+0x5AA86 && engineFn==address+0x5A6A8 &&
+   size>0x5CA12;
+  if(tglEDPPowerDomainReady){
+   tglPowerWellEnableAux=auxOnFn;tglPowerWellDisableAux=auxOffFn;
+   tglPowerWellEnableDDI=ddiOnFn;tglPowerWellDisableDDI=ddiOffFn;
+   tglPowerWellEnableEngine=engineFn;
+  }
+  root->setProperty("TGLEDPPowerDomainReady",tglEDPPowerDomainReady);
+  const char *edp="__ZN31AppleIntelFramebufferController10LightUpEDPEP21AppleIntelFramebufferP21AppleIntelDisplayPathPK29IODetailedTimingInformationV2";
+  const uint8_t lightEntry[]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x50,0x49,0x89,0xcf};
+  const auto lightFn=patcher.solveSymbol(index,edp,address,size);patcher.clearError();
+  bool ready=size>=0x508c4 && lightFn==address+0x5063e &&
+   !memcmp(reinterpret_cast<void *>(lightFn),lightEntry,sizeof(lightEntry));
+  // AI 修改: never collide with another already-installed LightUpEDP route.
+  if(ready && !orgADLSLightUpEDP && !orgTGLPanelLightUp) {
+   KernelPatcher::RouteRequest route(edp,wrapTGLPanelLightUp,orgTGLPanelLightUp);
+   ready=patcher.routeMultiple(index,&route,1,address,size);
+   patcher.clearError();
+  }
+  tglPanelLightUpReady=ready && orgTGLPanelLightUp;
+  root->setProperty("TGLPanelLightUpReady",tglPanelLightUpReady);
+  // AI 修改: retain the donor PPS entry used for the sink reset.
+  const char *pps="__ZN31AppleIntelFramebufferController15hwSetPanelPowerEj";
+  const uint8_t ppsEntry[]={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x53,0x48,0x83,0xec,0x28,0x89,0xf3,0x49,0x89,0xff};
+  const uint8_t ppsConfig[]={0x8b,0xb7,0x48,0x0d,0x00,0x00,0xe8,0x30,0xb1,0xff,0xff,0x83,0xfb,0x02};
+  const auto ppsFn=patcher.solveSymbol(index,pps,address,size);patcher.clearError();
+  tglPanelPowerFunctionReady=ppsFn==address+0x48652 && size>0x48B88 &&
+   !memcmp(reinterpret_cast<void *>(ppsFn),ppsEntry,sizeof(ppsEntry)) &&
+   !memcmp(reinterpret_cast<void *>(address+0x4866b),ppsConfig,sizeof(ppsConfig));
+  if(tglPanelPowerFunctionReady)tglPanelPowerFunction=ppsFn;
+  root->setProperty("TGLPanelPowerFunctionReady",tglPanelPowerFunctionReady);
+  }
+  tglEDPTrainingFixReady=trainingFix && tglPanelPowerFunctionReady && tglPanelLightUpReady;
+  root->setProperty("TGLEDPTrainingFixReady",tglEDPTrainingFixReady);
+ }
 }
 
 // Retain hwSetPanelPowerConfig's caller-serialization contract. The wrapper
@@ -18685,9 +18759,44 @@ uint32_t XE::wrapTGLPortTraining(void *port, void *request) {
 	auto caller = __builtin_return_address(0);
 	tglObservePath(port, nullptr, 0, false, 0, request != nullptr, caller);
 	const auto token = tglTrainingScopes.enter(reinterpret_cast<uintptr_t>(current_thread()));
+	// AI 修改: measure the native link-training duration and outcome.
+	uint64_t trainStart {}, trainEnd {};
+	clock_get_uptime(&trainStart);
 	const auto r = FunctionCast(wrapTGLPortTraining, callbackXE->orgTGLPortTraining)(port, request);
+	clock_get_uptime(&trainEnd);
 	tglTrainingScopes.leave(token);
  tglAUXRecord(port,10,true,r,0,0);
+	// AI 修改: diagnostics only; no behavior change.
+	{
+		uint64_t aNs {}, bNs {};
+		absolutetime_to_nanoseconds(trainStart, &aNs);
+		absolutetime_to_nanoseconds(trainEnd, &bNs);
+		const uint64_t ns = bNs >= aNs ? bNs - aNs : 0;
+		static uint32_t timingSeq;
+		const auto seq = __sync_add_and_fetch(&timingSeq, 1);
+		auto p = static_cast<uint8_t *>(port);
+		auto cfg = p ? *reinterpret_cast<uint32_t **>(p + 0x548) : nullptr;
+		const uint32_t ddi = cfg ? cfg[0] : UINT32_MAX;
+		const uint32_t lanes = p ? *reinterpret_cast<uint32_t *>(p + 0x124) : 0;
+		const uint32_t rate = p ? *reinterpret_cast<uint32_t *>(p + 0x128) : 0;
+		const uint32_t mode = p ? *reinterpret_cast<uint32_t *>(p + 0x550) : 0;
+		uint32_t rec[] = {1, seq, r, static_cast<uint32_t>(ns / 1000000), ddi,
+		                  lanes, rate, mode, static_cast<uint32_t>(ns % 1000000), 0};
+		auto root = IORegistryEntry::getRegistryRoot();
+		char key[48];
+		snprintf(key, sizeof(key), "TGLTrainingTimeLast%u", seq % 16);
+		root->setProperty(key, rec, sizeof(rec));
+		if (seq <= 16) {
+			snprintf(key, sizeof(key), "TGLTrainingTimeFirst%u", seq);
+			root->setProperty(key, rec, sizeof(rec));
+		}
+		root->setProperty("TGLTrainingTime", rec, sizeof(rec));
+		if (!r) {
+			uint32_t ok[] = {1, seq, static_cast<uint32_t>(ns / 1000000),
+			                 static_cast<uint32_t>(ns % 1000000), ddi};
+			root->setProperty("TGLTrainingSuccess", ok, sizeof(ok));
+		}
+	}
 	SYSLOG("igfx", "TGL330 port-training return result=%x", r);
 	static uint32_t count {};
 	IORegistryEntry::getRegistryRoot()->setProperty("TGLQuietTrainingCalls",
@@ -18712,6 +18821,112 @@ void XE::wrapTGLFreePath(void *path) {
 	FunctionCast(wrapTGLFreePath, callbackXE->orgTGLFreePath)(path);
 	if (callbackXE->tglPathPoolLock) IORecursiveLockUnlock(callbackXE->tglPathPoolLock);
 	tglObservePath(port, path, 2, true, 0, 0, caller);
+}
+
+// AI 修改: internal panel DDI for the eDP fix. Unlike tglPanelDepthPort this
+// does not require the port to be active (+0x117), because the fix may run
+// during a wake or teardown transition.
+uint32_t XE::tglPanelAuxDDI(void *port) {
+ auto s=callbackXE;auto p=static_cast<uint8_t *>(port);
+ auto c=static_cast<uint8_t *>(s->tglObservationController);
+ if(!p || !c || !s->tglActive)return 9;
+ auto cfg=*reinterpret_cast<uint32_t **>(p+0x548);
+ if(!cfg || cfg[0]>1 || cfg[2]!=0 || cfg[3]!=0)return 9;
+ if(!s->firmwarePorts.valid() || !(s->firmwarePorts.present&(1U<<cfg[0])) ||
+    !s->firmwarePorts.port[cfg[0]].internal() || !s->firmwarePorts.port[cfg[0]].dp())return 9;
+ return cfg[0];
+}
+
+// AI 修改: DDI/PG power-domain repair (part of -wex-edp-fix-training). The
+// display-sleep path can leave the DDI/AUX power-well references stale, so the
+// donor's own enable entries skip the hardware. Drain those references, run
+// the donor's display engine/PG enable sequence, then enable the panel DDI and
+// AUX once. The display-engine step intentionally bypasses the PG reference
+// short-circuit.
+void XE::tglPowerDomainRepair(void *controller,uint32_t ddi) {
+ auto s=callbackXE;auto ctl=static_cast<uint8_t *>(controller);
+ if(!s->tglEDPPowerDomainReady || !ctl || ctl!=s->tglObservationController || ddi>1)return;
+ auto power=*reinterpret_cast<uint8_t **>(ctl+0xC8);
+ auto access=*reinterpret_cast<void **>(ctl+0xC40);
+ if(!power || *reinterpret_cast<void **>(power+0x10)!=controller ||
+    *reinterpret_cast<void **>(power+0x78)!=access)return;
+ using RefFn=void (*)(void *,uint32_t);
+ using EngineFn=void (*)(void *);
+ const auto enableAux=reinterpret_cast<RefFn>(s->tglPowerWellEnableAux);
+ const auto disableAux=reinterpret_cast<RefFn>(s->tglPowerWellDisableAux);
+ const auto enableDDI=reinterpret_cast<RefFn>(s->tglPowerWellEnableDDI);
+ const auto disableDDI=reinterpret_cast<RefFn>(s->tglPowerWellDisableDDI);
+ const auto engine=reinterpret_cast<EngineFn>(s->tglPowerWellEnableEngine);
+ if(!enableAux || !disableAux || !enableDDI || !disableDDI || !engine)return;
+ const auto read=[&](uint32_t reg)->uint32_t {return s->orgTGLRegisterRead ?
+   FunctionCast(wrapTGLRegisterRead,s->orgTGLRegisterRead)(access,reg) : UINT32_MAX;};
+ auto &ddiRef=*reinterpret_cast<volatile uint32_t *>(power+0x30+4*ddi);
+ auto &auxRef=*reinterpret_cast<volatile uint32_t *>(power+0x54+4*ddi);
+ // {4, ddi, ddiBefore, auxBefore, ddiDrained, auxDrained, engineCalled,
+ //  ddiAfter, auxAfter, mainBefore, ioBefore, mainAfter, ioAfter, suspended, 0, 0}
+ uint32_t rec[16] {};
+ rec[0]=4;rec[1]=ddi;rec[2]=ddiRef;rec[3]=auxRef;
+ rec[9]=read(0x45404);rec[10]=read(0x45454);
+ uint32_t ddiDrained=0,auxDrained=0;
+ while(ddiRef && ddiDrained<16) {disableDDI(power,ddi);++ddiDrained;}
+ while(auxRef && auxDrained<16) {disableAux(power,ddi);++auxDrained;}
+ rec[4]=ddiDrained;rec[5]=auxDrained;
+ engine(power);
+ rec[6]=1;
+ enableDDI(power,ddi);rec[7]=ddiRef;
+ enableAux(power,ddi);rec[8]=auxRef;
+ rec[11]=read(0x45404);rec[12]=read(0x45454);
+ rec[13]=power[0x18];
+ IORegistryEntry::getRegistryRoot()->setProperty("TGLEDPPowerDomainLast",rec,sizeof(rec));
+}
+
+// AI 修改: independent internal eDP sink reset. No Tahoe route is used here:
+// the donor's own hwSetPanelPower entry cycles the panel supply before the
+// native internal LightUpEDP, mirroring a proven display sleep/wake so the
+// sink link/scrambler state is re-initialized. It runs before every internal
+// light-up (cold boot and each wake) and never changes the native result.
+uint32_t XE::wrapTGLPanelLightUp(void *controller,void *fb,void *path,const void *timing) {
+ auto self=callbackXE;auto ctl=static_cast<uint8_t *>(controller);
+ auto pb=path?*reinterpret_cast<uint8_t **>(static_cast<uint8_t *>(path)+0x3648):nullptr;
+ auto cfg=pb?*reinterpret_cast<uint32_t **>(pb+0x548):nullptr;
+ auto access=ctl?*reinterpret_cast<void **>(ctl+0xC40):nullptr;
+ // AI 修改: cycle only the qualified internal panel path.
+ if(self->tglEDPTrainingFixReady && self->tglPanelPowerFunctionReady && self->tglPanelPowerFunction &&
+    self->orgTGLRegisterRead && ctl==self->tglObservationController && access &&
+    fb==*reinterpret_cast<void **>(ctl+0xD60) && cfg && cfg[0]==0 && cfg[2]==0 && cfg[3]==0) {
+  const auto read=FunctionCast(wrapTGLRegisterRead,self->orgTGLRegisterRead);
+  static uint32_t cycleSeq;
+  // {2, seq, statusBefore, controlBefore, surface, mainPower, ioPower,
+  //  offResult, t12, onResult, statusAfter, 0}
+  uint32_t rec[12] {};
+  rec[0]=2;rec[1]=__sync_add_and_fetch(&cycleSeq,1);
+  rec[2]=read(access,0xC7200);rec[3]=read(access,0xC7204);
+  rec[4]=read(access,0x7019C);rec[5]=read(access,0x45404);rec[6]=read(access,0x45454);
+  using PanelPowerFn=uint32_t (*)(void *,uint32_t);
+  const auto panel=reinterpret_cast<PanelPowerFn>(self->tglPanelPowerFunction);
+  rec[7]=panel(ctl,0);
+  uint32_t t12=*reinterpret_cast<uint32_t *>(ctl+0x1558);
+  if(!t12 || t12>31)t12=6;
+  // AI 修改: donor T12 is expressed in 100 ms units; add 100 ms margin.
+  rec[8]=t12;
+  IOSleep(t12*100+100);
+  rec[9]=panel(ctl,2);
+  rec[10]=read(access,0xC7200);
+  auto root=IORegistryEntry::getRegistryRoot();
+  root->setProperty("TGLPanelCycle",rec,sizeof(rec));
+  if(!self->tglColdPanelCycleDone) {
+   self->tglColdPanelCycleDone=true;
+   root->setProperty("TGLPanelColdCycle",rec,sizeof(rec));
+  }
+ }
+ // AI 修改: DDI/PG power-domain repair, as late as possible before the native
+ // light-up.
+ if(self->tglEDPTrainingFixReady && self->tglEDPPowerDomainReady) {
+  const auto ddi=tglPanelAuxDDI(pb);
+  if(ddi<=1)tglPowerDomainRepair(controller,ddi);
+ }
+ // AI 修改: always run the native light-up and keep its result unchanged.
+ return FunctionCast(wrapTGLPanelLightUp,self->orgTGLPanelLightUp)(controller,fb,path,timing);
 }
 
 uint32_t XE::wrapTGLLightUpDP(void *controller, void *fb, void *path, const void *timing) {

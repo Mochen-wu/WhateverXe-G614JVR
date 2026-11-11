@@ -1,0 +1,87 @@
+Before / after, as observed on G614JVR
+=====================================
+All values read from the IORegistry root node or the iGPU PCI device.
+"stock" = WhateverXe 0.8.0 release binary, unmodified.
+"patched" = this report's build.
+
+1. Firmware panel facts
+-----------------------
+stock    WhateverXeFirmwarePanel = 0000000000000000000000000000000000000000
+         -> valid=0, type=0, ddi=9     (ddi 9 == "no internal port")
+patched  WhateverXeFirmwarePanel = 01000000000000000000000001000000000000000000
+         -> valid=1, type=0, ddi=0
+
+Consequence: XELP::PanelPower::nativePPS0() returns false while ddi==9, so every
+downstream consumer of the panel record is skipped.
+
+2. Admission switch
+-------------------
+stock    WEXEDPPanelFix            <absent>
+patched  WEXEDPPanelFix            Yes
+
+3. eDP repair stages
+--------------------
+stock    TGLEDPTrainingFix         <absent>
+         TGLEDPTrainingFixReady    <absent>
+         TGLEDPPowerDomainReady    <absent>
+         TGLPanelLightUpReady      <absent>
+         TGLPanelPowerFunctionReady <absent>
+
+patched  TGLEDPTrainingFix         Yes
+         TGLEDPTrainingFixReady    Yes
+         TGLEDPPowerDomainReady    Yes
+         TGLPanelLightUpReady      Yes
+         TGLPanelPowerFunctionReady Yes
+
+These properties did not exist with a false value on stock 0.8.0. They did not
+exist at all, because the block that publishes them was never entered.
+
+4. Intermediate state (VBT fix only, admission gate still TGL-only)
+-------------------------------------------------------------------
+A useful datapoint: with only group A applied, the panel record became
+valid=1/ddi=0 and nativePPS0() returned true when asked with the RPL-S family,
+yet TGLEDPTrainingFix was still absent, because the code asked
+displayAdapter(family) for TGL and got ADLS. This isolates the two defects.
+
+5. Panel power cycle
+--------------------
+stock    TGLPanelColdCycle        <absent>
+patched  TGLPanelColdCycle        02000000010000000800008063000000000000003f000000
+                                  000000000000000006000000000000000800008000000000
+
+Decoded: seq=1, PP_STATUS before=0x80000008, PP_CONTROL=0x63, surface=0,
+main power=0x3F, IO power=0, off result=0, T12=6 (600 ms), on result=0,
+PP_STATUS after=0x80000008.
+
+6. DDI / PG power well
+----------------------
+stock    TGLEDPPowerDomainLast    <absent>
+patched  TGLEDPPowerDomainLast    040000000000000001000000010000000100000001000000
+                                  010000000100000001000000030000000300000003000000
+                                  03000000000000000000000000000000
+
+Decoded: ddi=0, DDI refcount before=1, AUX refcount before=1, drained 1+1,
+display engine enabled, DDI after=1, AUX after=1, main power=0x3, IO power=0x3.
+
+7. What did NOT change
+----------------------
+stock    TGLAUX0Count             633
+patched  TGLAUX0Count             636
+
+stock    TGLBootstrapAUXReady     No
+patched  TGLBootstrapAUXReady     No
+
+stock    TGLFramebufferStartResult Yes
+patched  TGLFramebufferStartResult Yes
+
+The AUX counters were the main false lead while diagnosing this. They are
+populated by the early bootstrap AUX probe, before the panel is powered, and do
+not move when the panel afterwards lights up. They are not a usable success
+signal on this platform.
+
+8. Internal display
+-------------------
+stock    black; with the iGPU as the only framebuffer the desktop came up on
+         IONDRVFramebuffer at 15 MB with no acceleration
+patched  Intel UHD Graphics, 2560x1600, VRAM 1536 MB, framebuffer 0/1/2 online,
+         Metal acceleration running alongside the discrete GPU

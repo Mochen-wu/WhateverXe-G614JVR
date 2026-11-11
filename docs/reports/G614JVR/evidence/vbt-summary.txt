@@ -1,0 +1,42 @@
+# VBT decode — ASUS ROG Strix G16 (G614JVR), iGPU 8086:A788
+# Produced by tools/decode-vbt.py from the TGLVBT property WEX republishes
+
+VBT signature      : $VBT
+VBT size           : 8666 bytes
+BDB offset         : 0x30
+BDB version        : 250
+BDB header / size  : 22 / 8617
+
+Blocks present     :
+  BDB1   offset=0x133   size=10
+  BDB2   offset=0x185   size=356
+  BDB9   offset=0x369   size=100
+  BDB10  offset=0x3d0   size=203
+  BDB12  offset=0x49e   size=19
+  BDB20  offset=0x4b4   size=170
+  BDB27  offset=0x561   size=812
+  BDB40  offset=0x890   size=34
+  BDB42  offset=0x8b5   size=1366
+  BDB43  offset=0xe0e   size=305
+  BDB44  offset=0xf42   size=78
+  BDB46  offset=0xf93   size=304
+  BDB51  offset=0x10c6  size=9
+  BDB52  offset=0x10d2  size=822
+  BDB56  offset=0x140b  size=210
+  BDB57  offset=0x14e0  size=2642
+  BDB252 offset=0x2ec   size=122
+  BDB253 offset=0x140   size=66
+  BDB254 offset=0x46    size=234
+
+--- panel facts inputs ---
+BDB40 (CHILD_DEVICES) byte 0 : 0xff (255)  <- PPS index
+  valid PPS index (<16)?     : no
+BDB27 (LFP_PANEL_1) size     : 812
+  delays for type 0 (x100us): [2000, 1000, 2000, 500, 5000]
+BDB43 (BACKLIGHT) size       : 305
+  entry for type 0          : 4ae8030658aa
+  pwmPresent                 : True
+  activeLowPWM               : False
+  pwmHz                      : 1000
+  backlightType / controller : 2 / 0
+BDB44 (POWER_SEQUENCE) size  : 78
