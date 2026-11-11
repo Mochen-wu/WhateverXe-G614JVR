@@ -1,3 +1,24 @@
+# WhateverXe‑0.8.0 定制版｜华硕枪神 8 G614JVR
+
+> 测试机型：G614JVR，基于 workbuddy Ai 模型修改编译
+> 上游原项目：https://github.com/b00t0x/WhateverXe
+> 时间：2026‑11‑11
+> 硬件配置：华硕枪神 8 G614JVR｜i9‑14900HX｜RTX4060｜macOS 26.7.2
+> 核显：英特尔 UHD Graphics `8086:A788`（子系统 `1043:3488`）
+
+## 这是什么 & 开发背景
+由于原驱动限制，集显虽然可以正常驱动，但内屏无法上电；同时本机 S3 睡眠直接失败。后来偶然看见一位网友提起：这台机器需要成功进入 S3 睡眠，才可以在唤醒后点亮内屏。
+
+顺着这个线索，我意识到原生 WhateverXe 的 eDP 修复逻辑没有适配 RaptorLake‑S 的 14 代 HX 笔记本，原生代码会直接跳过内屏修复路径。
+
+因此借助 workbuddy AI 辅助，阅读、修改源码并自行编译 `WhateverXe.kext`，实现英特尔核显 A788 的 eDP 内屏驱动。
+原版 0.8.0 在本机型上会静默跳过整段 eDP 修复代码，开机内屏始终黑屏，外接显示器可以正常输出。本修改打通了该适配路径，需要配合启动参数 `-wex-ddi-conflict-select-first` 使用。
+
+## 重要致谢
+非常感谢 **b00t0x** 开发维护上游项目：[https://github.com/b00t0x/WhateverXe](https://github.com/b00t0x/WhateverXe)，本项目所有底层逻辑均基于其开源成果进行二次修改。
+
+感谢 workbuddy Ai 模型，辅助完成源码分析与修改；同时感谢论坛网友分享 S3 睡眠唤醒点亮内屏的关键线索。
+
 # WhateverXe
 
 [日本語](README_ja.md)
